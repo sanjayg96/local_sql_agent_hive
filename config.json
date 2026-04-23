@@ -1,0 +1,7 @@
+{
+  "analyst_model": "qwen2.5-coder:7b",
+  "architect_model": "qwen2.5-coder:7b",
+  "auditor_model": "llama3.1:8b-instruct-q4_K_M",
+  "max_retries": 3,
+  "database_path": "data/database/spider.sqlite"
+}
