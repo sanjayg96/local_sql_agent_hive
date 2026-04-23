@@ -1,0 +1,13 @@
+[project]
+name = "solver-army"
+version = "0.1.0"
+description = "Local multi-agent Text-to-SQL architecture"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-core>=1.3.0",
+    "langchain-ollama>=1.1.0",
+    "langgraph>=1.1.9",
+    "pydantic>=2.13.3",
+    "streamlit>=1.32.0",  # Added for the UI
+]
