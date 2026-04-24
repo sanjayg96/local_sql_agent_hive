@@ -1,26 +1,21 @@
 import json
+import sqlite3
 import logging
 from typing import Annotated, TypedDict, List, Dict, Any
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, BaseMessage
-from langchain_core.prompts import ChatPromptTemplate
-from sandbox_sql import execute_sql  # Your existing module
+from sandbox_sql import execute_sql
 
 # Load Config
 with open("config.json", "r") as f:
     config = json.load(f)
 
-# Initialize Models (Memory Management via keep_alive)
-# Analyst: Keep alive for 5m (lightweight, highly used)
-analyst_llm = ChatOllama(model=config["analyst_model"], format="json", keep_alive="5m")
-# Architect: Keep alive for 5m (core generator)
+# Initialize Models
 architect_llm = ChatOllama(model=config["architect_model"], keep_alive="5m")
-# Auditor: Drop immediately after use (keep_alive=0) to free RAM since it only runs on errors
 auditor_llm = ChatOllama(model=config["auditor_model"], keep_alive=0)
 
-# --- State Definition ---
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], "The chat history"]
     question: str
@@ -30,43 +25,66 @@ class AgentState(TypedDict):
     sql_query: str
     sandbox_result: Dict[str, Any]
     retries: int
-    trace: List[Dict[str, str]] # For Streamlit UI
+    error_classification: str # NEW: Tracks the type of error for targeted retries
+    trace: List[Dict[str, str]]
 
-# --- Nodes ---
+def get_table_peek(db_path: str) -> str:
+    """Helper: Fetches 3 sample rows from every table to prevent categorical hallucinations."""
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cursor.fetchall() if row[0] != "sqlite_sequence"]
+        
+        peek_info = "\n### TABLE SAMPLES (LIMIT 3) ###\n"
+        for table in tables:
+            cursor.execute(f"PRAGMA table_info('{table}');")
+            columns = [col[1] for col in cursor.fetchall()]
+            cursor.execute(f"SELECT * FROM '{table}' LIMIT 3;")
+            rows = cursor.fetchall()
+            peek_info += f"-- Table: {table} --\nColumns: {', '.join(columns)}\nSample Data: {rows}\n\n"
+        conn.close()
+        return peek_info
+    except Exception as e:
+        return f"Could not load samples: {str(e)}"
+
 def analyze_schema(state: AgentState):
-    """
-    Agent 1: Schema Analyst. 
-    For small databases (like Spider), passing the full schema is better than pruning.
-    We format it cleanly for the Architect.
-    """
-    # Instead of destructive pruning, we structure the raw schema perfectly for the coder.
-    structured_schema = f"### DATABASE SCHEMA ###\n{state['raw_schema']}\n"
+    """Agent 1: Schema Analyst + Peek Method."""
+    db_path = f"data/database/{state['db_id']}/{state['db_id']}.sqlite"
+    peek_data = get_table_peek(db_path)
     
-    state["trace"].append({"agent": "Analyst", "action": "Structured Schema", "data": "Full schema passed."})
+    # Combine full schema with the actual row data
+    structured_schema = f"### DATABASE SCHEMA ###\n{state['raw_schema']}\n{peek_data}"
+    
+    state["trace"].append({"agent": "Analyst", "action": "Structured Schema w/ Peek", "data": "Full schema + 3-row samples attached."})
     return {"pruned_schema": structured_schema, "trace": state["trace"]}
 
 def generate_sql(state: AgentState):
-    """Agent 2: Writes the raw SQLite query."""
+    """Agent 2: Writes the raw SQLite query with Targeted Self-Correction."""
     sys_prompt = """You are an elite expert SQLite developer. 
-    Write ONLY valid SQLite code to answer the user's question based on the schema provided. 
+    Write ONLY valid SQLite code to answer the user's question based on the schema and sample data.
     Pay strict attention to table relationships and foreign keys for JOINs.
+    Look at the sample data to understand categorical formats (e.g., 'M' vs 'Male').
     Do not use markdown formatting like ```sql. Just the raw query."""
     
     if state["retries"] > 0 and state.get("sandbox_result"):
         error_msg = state["sandbox_result"].get("error", "Unknown error")
-        prev_data = state["sandbox_result"].get("data", [])
+        error_class = state.get("error_classification", "UNKNOWN")
         
-        sys_prompt += f"\n\n### SELF-CORRECTION ###\n"
+        sys_prompt += f"\n\n### TARGETED SELF-CORRECTION ###\n"
         sys_prompt += f"PREVIOUS QUERY: {state['sql_query']}\n"
         
-        if not state["sandbox_result"].get("success"):
-            sys_prompt += f"EXECUTION ERROR: {error_msg}\nFix the syntax or column names."
-        elif len(prev_data) == 0:
-            sys_prompt += f"LOGICAL ERROR: The query executed but returned no data ([]). You likely missed a JOIN, used the wrong WHERE condition, or queried the wrong table. Rethink the logic."
+        if error_class == "SYNTAX_ERROR":
+            sys_prompt += f"ERROR CLASSIFICATION: Syntax/Execution Failure.\n"
+            sys_prompt += f"SQLITE ERROR: {error_msg}\n"
+            sys_prompt += "Fix the syntax, table name, or column name exactly as SQLite suggests."
+        elif error_class == "EMPTY_LOGIC":
+            sys_prompt += f"ERROR CLASSIFICATION: Logical Failure (Returned Empty Data).\n"
+            sys_prompt += "The query executed successfully but returned zero rows ([]). You likely missed a required JOIN, used an overly restrictive WHERE clause, or checked for a value that doesn't exist in the format you provided. Rethink the logic."
 
     messages = [
         SystemMessage(content=sys_prompt),
-        HumanMessage(content=f"Schema:\n{state['pruned_schema']}\n\nQuestion: {state['question']}")
+        HumanMessage(content=f"Schema & Data:\n{state['pruned_schema']}\n\nQuestion: {state['question']}")
     ]
     
     response = architect_llm.invoke(messages)
@@ -76,39 +94,36 @@ def generate_sql(state: AgentState):
     return {"sql_query": clean_sql, "trace": state["trace"]}
 
 def run_sandbox(state: AgentState):
-    """Agent 3: Executes the SQL against the local DB dynamically."""
-    # Dynamically route to the correct Spider database
     db_path = f"data/database/{state['db_id']}/{state['db_id']}.sqlite"
-    
     result = execute_sql(db_path, state["sql_query"])
     state["trace"].append({"agent": "Sandbox", "action": "Executed Query", "data": str(result)})
     return {"sandbox_result": result, "trace": state["trace"]}
 
 def audit_result(state: AgentState):
-    """Agent 4: Checks for execution errors AND empty logical returns."""
+    """Agent 4: Classifies errors for the Architect."""
     result = state["sandbox_result"]
-    
-    # Trigger a retry if execution fails OR if it returns an empty list (likely a bad JOIN)
     is_empty_return = result.get("success") and len(result.get("data", [])) == 0
     
     if not result.get("success") or is_empty_return:
-        reason = "Execution Error" if not result.get("success") else "Empty Logic Result"
-        state["trace"].append({"agent": "Auditor", "action": f"Retry Triggered ({reason})", "data": result.get('error', 'Returned []')})
-        return {"retries": state["retries"] + 1, "trace": state["trace"]}
+        error_class = "SYNTAX_ERROR" if not result.get("success") else "EMPTY_LOGIC"
+        reason = result.get('error') if error_class == "SYNTAX_ERROR" else "Returned []"
+        
+        state["trace"].append({"agent": "Auditor", "action": f"Retry Triggered ({error_class})", "data": reason})
+        return {"retries": state["retries"] + 1, "error_classification": error_class, "trace": state["trace"]}
     
-    # If successful and returned data, format final answer
     state["trace"].append({"agent": "Auditor", "action": "Approved", "data": str(result['data'])})
-    return {"messages": [AIMessage(content=str(result["data"]))] }
+    return {"messages": [AIMessage(content=str(result["data"]))]}
 
 # --- Routing Logic ---
 def route_audit(state: AgentState):
-    if state["sandbox_result"].get("success") or state["retries"] >= config["max_retries"]:
+    if state["sandbox_result"].get("success") and len(state["sandbox_result"].get("data", [])) > 0:
+        return END
+    if state["retries"] >= config["max_retries"]:
         return END
     return "generate_sql"
 
 # --- Graph Compilation ---
 workflow = StateGraph(AgentState)
-
 workflow.add_node("analyze_schema", analyze_schema)
 workflow.add_node("generate_sql", generate_sql)
 workflow.add_node("run_sandbox", run_sandbox)
@@ -120,6 +135,5 @@ workflow.add_edge("generate_sql", "run_sandbox")
 workflow.add_edge("run_sandbox", "audit_result")
 workflow.add_conditional_edges("audit_result", route_audit)
 
-# Use MemorySaver to maintain conversational context across graph invocations
 memory = MemorySaver()
 hive_app = workflow.compile(checkpointer=memory)
